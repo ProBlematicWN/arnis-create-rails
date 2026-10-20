@@ -100,7 +100,12 @@ impl Block {
 
     #[inline(always)]
     pub fn namespace(&self) -> &str {
-        "minecraft"
+        // Create-mod track blocks live in the `create` namespace; everything
+        // else is vanilla `minecraft` (see `CREATE_TRACK` / `CREATE_FAKE_TRACK`).
+        match self.id {
+            487 | 488 => "create",
+            _ => "minecraft",
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -571,6 +576,9 @@ impl Block {
             484 => "melon",
             485 => "loom",
             486 => "smithing_table",
+            // Create-mod track blocks (namespace `create`).
+            487 => "track",
+            488 => "fake_track",
             _ => return None,
         })
         // Block ids are u16 handles; keep the name and property tables in sync
@@ -1589,6 +1597,31 @@ pub const SNOW_LAYERS: [Block; 7] = [
     Block::new(478),
     Block::new(479),
 ];
+/// Create-mod train track (`create:track`).
+///
+/// One block id for the whole block: the track shape is a block-state
+/// property (`shape`), so a single section can hold many shapes of the same
+/// block (the palette keys entries by `(block, properties)`, see
+/// `world_editor::common::make_palette_item`). `turn` (BE presence) and
+/// `waterlogged` both default to `false` and are omitted unless set.
+pub const CREATE_TRACK: Block = Block::new(487);
+/// Create-mod fake track (`create:fake_track`); reserved for the stage-5
+/// work, not written yet.
+pub const CREATE_FAKE_TRACK: Block = Block::new(488);
+
+/// The `shape` block-state property for a `create:track` block.
+///
+/// `shape` is the only non-default state written in the early stages: `turn`
+/// and `waterlogged` default to `false`, so they are omitted and Minecraft
+/// fills them in. The serialized `shape` values are Create 6.0.10's
+/// `TrackShape` names lowercased (`zo`, `xo`, `pd`, `nd`, `an`, `as`, `ae`,
+/// `aw`, `cr_o`, `cr_d`, `cr_pdx`, `cr_pdz`, `cr_ndx`, `cr_ndz`); see NOTES.md.
+pub fn create_track_shape(shape: &str) -> Value {
+    Value::Compound(HashMap::from([(
+        "shape".to_string(),
+        Value::String(shape.to_string()),
+    )]))
+}
 
 /// Maps a block to a stair variant in the same colour family.
 #[inline]

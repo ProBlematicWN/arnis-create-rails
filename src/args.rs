@@ -239,6 +239,11 @@ pub struct Args {
     #[arg(long = "world-type", value_enum, default_value_t = WorldType::Void)]
     pub world_type: WorldType,
 
+    /// Generate the deterministic track test world (no OSM data) into the given
+    /// directory and exit. Development aid for verifying track generation in-game.
+    #[arg(long, hide = true, value_name = "WORLD_DIR")]
+    pub track_test_world: Option<PathBuf>,
+
     /// Readable image signs, Java only. `basic` covers public signage: street names,
     /// traffic signs, transit stops, information boards and billboards. `full` adds
     /// building signage: shop name plates, house numbers and crossing signs.

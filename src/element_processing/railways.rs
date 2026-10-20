@@ -691,7 +691,10 @@ fn generate_rail_bridge(
 
 /// Choose between a flat or ascending rail block based on the ground-level
 /// difference between the previous, current, and next track points.
-fn determine_rail_with_slope(
+/// Selects the rail block for one cell from its (prev, current, next)
+/// context and the ground levels. `pub(crate)` so the track test world
+/// (`src/track_test_world.rs`) places rails exactly as the pipeline does.
+pub(crate) fn determine_rail_with_slope(
     current: (i32, i32),
     prev: Option<(i32, i32)>,
     next: Option<(i32, i32)>,
@@ -733,7 +736,7 @@ fn ascending_toward(from: (i32, i32), to: (i32, i32)) -> Block {
     }
 }
 
-fn smooth_diagonal_rails(points: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
+pub(crate) fn smooth_diagonal_rails(points: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
     let mut smoothed = Vec::new();
 
     for i in 0..points.len() {

@@ -814,7 +814,9 @@ mod tests {
 
     /// Blocks Mineclonia has no node for, so they can only fall back. Keep this
     /// list short: every entry is a block that exports as plain stone.
-    const NO_MINECLONIA_NODE: &[&str] = &["tripwire_hook"];
+    // `track` / `fake_track` are Create-mod blocks (namespace `create`);
+    // Mineclonia has no Minetest equivalent for them.
+    const NO_MINECLONIA_NODE: &[&str] = &["tripwire_hook", "track", "fake_track"];
 
     /// The fallback arm is silent -- an unmapped block turns into stone in the
     /// exported world rather than failing. Walk the whole palette so that adding

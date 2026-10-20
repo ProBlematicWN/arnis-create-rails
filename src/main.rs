@@ -59,6 +59,7 @@ mod terrain_surface;
 #[cfg(test)]
 mod test_utilities;
 mod tile;
+mod track_test_world;
 mod trees;
 mod version_check;
 mod voxy;
@@ -214,6 +215,25 @@ fn run_cli() {
     // Parse input arguments
     let mut args: Args = Args::parse();
     args::apply_body_defaults(&mut args);
+
+    // The track test world needs no OSM data and no bbox: generate it and exit.
+    if let Some(world_dir) = args.track_test_world.clone() {
+        match track_test_world::generate(&world_dir) {
+            Ok(world_path) => {
+                println!(
+                    "{} Track test world created at: {}",
+                    "Done!".green().bold(),
+                    world_path.display().to_string().bright_white().bold()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}: {}", "Error".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Caves carve into the filled ground, so they bring it with them.
     if args.caves {
         args.fillground = true;
