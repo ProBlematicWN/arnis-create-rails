@@ -277,7 +277,14 @@ fn generate_at_grade_rail(editor: &mut WorldEditor, element: &ProcessedWay) {
                 next_ground,
             );
 
-            editor.set_block(rail_block, bx, 1, bz, None, None);
+            editor.set_block_with_properties(
+                at_grade_rail_props(rail_block),
+                bx,
+                1,
+                bz,
+                None,
+                None,
+            );
 
             if tds.is_multiple_of(4) {
                 editor.set_block(OAK_LOG, bx, 0, bz, None, None);
@@ -689,6 +696,20 @@ fn generate_rail_bridge(
     );
 }
 
+/// Stage 2: straight at-grade rails become Create tracks — one block id
+/// (`CREATE_TRACK`), the axis carried by the `shape` state property
+/// (`turn=false`, no block entity). Slopes (stage 4) and curves (stage 3)
+/// stay vanilla rails until converted.
+/// `pub(crate)` so the track test world (`src/track_test_world.rs`) places
+/// rails exactly as the pipeline does.
+pub(crate) fn at_grade_rail_props(rail: Block) -> BlockWithProperties {
+    match rail {
+        RAIL_NORTH_SOUTH => BlockWithProperties::new(CREATE_TRACK, Some(create_track_shape("zo"))),
+        RAIL_EAST_WEST => BlockWithProperties::new(CREATE_TRACK, Some(create_track_shape("xo"))),
+        other => BlockWithProperties::simple(other),
+    }
+}
+
 /// Choose between a flat or ascending rail block based on the ground-level
 /// difference between the previous, current, and next track points.
 /// Selects the rail block for one cell from its (prev, current, next)
@@ -1086,11 +1107,25 @@ mod tests {
     use super::*;
     use crate::coordinate_system::geographic::LLBBox;
     use crate::osm_parser::ProcessedNode;
+    use fastnbt::Value;
     use std::path::PathBuf;
 
     fn test_editor(xzbbox: &XZBBox) -> WorldEditor<'_> {
         let llbbox = LLBBox::new(54.6, 9.9, 54.61, 9.91).unwrap();
         WorldEditor::new(PathBuf::from("/dev/null/unused"), xzbbox, llbbox)
+    }
+
+    /// The `shape` state property of the block at (x, y-offset, z), if stored.
+    fn track_shape(editor: &WorldEditor, x: i32, y: i32, z: i32) -> Option<String> {
+        let absolute_y = editor.get_absolute_y(x, y, z);
+        let Some(Value::Compound(props)) = editor.block_properties_absolute(x, absolute_y, z)
+        else {
+            return None;
+        };
+        match props.get("shape") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        }
     }
 
     // The same carve as before deduplication: every listed point, in order.
@@ -1161,6 +1196,32 @@ mod tests {
         let got = build(&|e| carve_rail_tunnel_interior(e, &points));
         assert_eq!(got, want);
         assert!(got.contains(&Some(SEA_LANTERN.id())));
+    }
+
+    /// A straight north-south rail from z=20 to z=60 at x=50.
+    fn straight_rail_ns(tags: &[(&str, &str)]) -> ProcessedWay {
+        let mut t = HashMap::new();
+        for (k, v) in tags {
+            t.insert(k.to_string(), v.to_string());
+        }
+        ProcessedWay {
+            id: 2,
+            nodes: vec![
+                ProcessedNode {
+                    id: 3,
+                    tags: HashMap::new(),
+                    x: 50,
+                    z: 20,
+                },
+                ProcessedNode {
+                    id: 4,
+                    tags: HashMap::new(),
+                    x: 50,
+                    z: 60,
+                },
+            ],
+            tags: t,
+        }
     }
 
     // A straight east-west rail from x=20 to x=60 at z=50 (so cell index == x - 20).
@@ -1236,8 +1297,13 @@ mod tests {
         run(&mut editor, &way, &CoordinateBitmap::new(&xzbbox));
 
         assert!(
-            editor.check_for_block(20, 1, 50, Some(&[RAIL_EAST_WEST])),
-            "plain vanilla rail"
+            editor.check_for_block(20, 1, 50, Some(&[CREATE_TRACK])),
+            "straight at-grade rail is a Create track"
+        );
+        assert_eq!(
+            track_shape(&editor, 20, 1, 50).as_deref(),
+            Some("xo"),
+            "shape follows the E-W axis"
         );
         assert!(
             !editor.check_for_block(20, 0, 49, Some(&[ANVIL])),
@@ -1265,8 +1331,8 @@ mod tests {
         run(&mut editor, &way, &CoordinateBitmap::new(&xzbbox));
 
         assert!(
-            editor.check_for_block(20, 1, 50, Some(&[RAIL_EAST_WEST])),
-            "tram keeps its rail"
+            editor.check_for_block(20, 1, 50, Some(&[CREATE_TRACK])),
+            "tram keeps its straight rail as a Create track"
         );
         assert!(
             !editor.check_for_block(20, CATENARY_WIRE_HEIGHT, 50, Some(&[CHAIN_X, CHAIN_Z])),
@@ -1412,6 +1478,68 @@ mod tests {
             !footprint.contains(40, 53),
             "footprint stops outside the 5x5 shell"
         );
+    }
+
+    #[test]
+    fn at_grade_rail_props_maps_straights_to_create_and_keeps_the_rest_vanilla() {
+        for (rail, shape) in [(RAIL_NORTH_SOUTH, "zo"), (RAIL_EAST_WEST, "xo")] {
+            let props = at_grade_rail_props(rail);
+            assert_eq!(props.block, CREATE_TRACK);
+            let expected = Value::String(shape.to_string());
+            let stored = match props.properties.as_deref() {
+                Some(Value::Compound(m)) => m.get("shape"),
+                _ => None,
+            };
+            assert_eq!(
+                stored,
+                Some(&expected),
+                "straight rail carries its axis as shape"
+            );
+        }
+        // Curves (stage 3) and slopes (stage 4) stay vanilla rails for now.
+        for rail in [
+            RAIL_NORTH_EAST,
+            RAIL_NORTH_WEST,
+            RAIL_SOUTH_EAST,
+            RAIL_SOUTH_WEST,
+            RAIL_ASCENDING_NORTH,
+            RAIL_ASCENDING_SOUTH,
+            RAIL_ASCENDING_EAST,
+            RAIL_ASCENDING_WEST,
+        ] {
+            let props = at_grade_rail_props(rail);
+            assert_eq!(props.block, rail, "{rail:?} stays vanilla");
+            assert!(props.properties.is_none());
+        }
+    }
+
+    #[test]
+    fn at_grade_straight_rails_become_create_tracks() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(200.0, 120.0).unwrap();
+
+        // East-west way: `create:track` with `shape=xo` on the gravel bed.
+        let mut editor = test_editor(&xzbbox);
+        let way = straight_rail(&[("railway", "rail")]);
+        run(&mut editor, &way, &CoordinateBitmap::new(&xzbbox));
+        assert!(
+            editor.check_for_block(20, 1, 50, Some(&[CREATE_TRACK])),
+            "E-W straight rail is a Create track"
+        );
+        assert_eq!(track_shape(&editor, 20, 1, 50).as_deref(), Some("xo"));
+        assert!(
+            editor.check_for_block(20, 0, 50, Some(&[GRAVEL, OAK_LOG])),
+            "gravel bed / sleeper stays under the track"
+        );
+
+        // North-south way: `shape=zo`.
+        let mut editor = test_editor(&xzbbox);
+        let way = straight_rail_ns(&[("railway", "rail")]);
+        run(&mut editor, &way, &CoordinateBitmap::new(&xzbbox));
+        assert!(
+            editor.check_for_block(50, 1, 20, Some(&[CREATE_TRACK])),
+            "N-S straight rail is a Create track"
+        );
+        assert_eq!(track_shape(&editor, 50, 1, 20).as_deref(), Some("zo"));
     }
 
     #[test]

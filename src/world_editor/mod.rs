@@ -2062,6 +2062,32 @@ impl<'a> WorldEditor<'a> {
         );
     }
 
+    /// Sets a block with properties at the given coordinates.
+    ///
+    /// Y value is interpreted as an offset from ground level.
+    #[inline]
+    pub fn set_block_with_properties(
+        &mut self,
+        block_with_props: BlockWithProperties,
+        x: i32,
+        y: i32,
+        z: i32,
+        override_whitelist: Option<&[Block]>,
+        override_blacklist: Option<&[Block]>,
+    ) {
+        if !self.xzbbox.contains(&XZPoint::new(x, z)) {
+            return;
+        }
+        self.set_block_with_properties_absolute(
+            block_with_props,
+            x,
+            self.get_absolute_y(x, y, z),
+            z,
+            override_whitelist,
+            override_blacklist,
+        );
+    }
+
     /// Sets a block of the specified type at the given coordinates with absolute Y value.
     #[inline]
     pub fn set_block_absolute(

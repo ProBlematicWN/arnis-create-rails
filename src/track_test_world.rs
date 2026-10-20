@@ -6,11 +6,20 @@
 //! is fully deterministic, so the world regenerates identically on every
 //! run.
 //!
+//! Stage 2 mapping applies: the straight segments are `create:track` blocks
+//! (`shape=zo`/`xo`, `turn=false`); the single ascending cell on track D
+//! stays a vanilla rail until stage 4.
+//!
+//! The track C corner (48,24) has no stage-2 equivalent: exactly like the
+//! pipeline, the cell keeps the first segment's straight shape (`zo`), so
+//! the E-W arm starts at (49,24). Both arms are complete straight Create
+//! tracks; the corner joint is expected to be broken until stage 3 (curves).
+//!
 //! Used to verify the generated world in-game (MC 1.21.1 + Create) before
 //! and during the Create track format work (see ROADMAP stage 0). The rail
-//! selection reuses the pipeline's own `determine_rail_with_slope`, so the
-//! mini-world's rails are exactly what the pipeline would place for the
-//! same ground profile.
+//! selection reuses the pipeline's own `determine_rail_with_slope` and
+//! `at_grade_rail_props`, so the mini-world's rails are exactly what the
+//! pipeline would place for the same ground profile.
 //!
 //! Trains: Create trains are `create:carriage_contraption` entities (spawned
 //! from `create:carriage` blocks), not vanilla `minecraft:minecart`. This
@@ -32,7 +41,9 @@ use crate::block_definitions::{
 use crate::bresenham::bresenham_line;
 use crate::coordinate_system::cartesian::XZBBox;
 use crate::coordinate_system::geographic::LLBBox;
-use crate::element_processing::railways::{determine_rail_with_slope, smooth_diagonal_rails};
+use crate::element_processing::railways::{
+    at_grade_rail_props, determine_rail_with_slope, smooth_diagonal_rails,
+};
 use crate::world_editor::WorldEditor;
 use crate::world_utils;
 
@@ -71,6 +82,14 @@ const SPAWN: (i32, i32, i32) = (20, -61, 16);
 /// flat ground, away from the vanilla test rails, in chunk (0,0).
 /// `(x, z, shape)` — `xo` is the east–west straight, `zo` the north–south one.
 const CREATE_TRACKS: &[(i32, i32, &str)] = &[(10, 10, "xo"), (12, 12, "zo")];
+
+/// A straight north–south line of `create:track` blocks (`shape=zo`), for the
+/// in-game compatibility check: is a generated track a *functional* Create
+/// track (a carriage rides it end-to-end) or just a decorative block? Placed
+/// on flat ground, clear of the vanilla test rails.
+const CREATE_TRACK_LINE_X: i32 = 30;
+const CREATE_TRACK_LINE_Z0: i32 = 20;
+const CREATE_TRACK_LINE_Z1: i32 = 44;
 
 /// Generate the track test world into `world_dir`.
 ///
@@ -123,6 +142,21 @@ pub fn generate(world_dir: &Path) -> Result<PathBuf, String> {
             *x,
             GROUND_LEVEL + 1,
             *z,
+            None,
+            None,
+        );
+    }
+
+    // 4c. A straight Create track line (compatibility check): a run of
+    //     `create:track` blocks with `shape=zo`, `turn=false`. If a carriage
+    //     rides it end-to-end in-game, the generated track is functional,
+    //     not decorative.
+    for z in CREATE_TRACK_LINE_Z0..=CREATE_TRACK_LINE_Z1 {
+        editor.set_block_with_properties_absolute(
+            BlockWithProperties::new(CREATE_TRACK, Some(create_track_shape("zo"))),
+            CREATE_TRACK_LINE_X,
+            GROUND_LEVEL + 1,
+            z,
             None,
             None,
         );
@@ -231,7 +265,14 @@ fn place_track(editor: &mut WorldEditor, track: &[(i32, i32)]) {
                 next_ground,
             );
 
-            editor.set_block_absolute(rail_block, bx, current_ground + 1, bz, None, None);
+            editor.set_block_with_properties_absolute(
+                at_grade_rail_props(rail_block),
+                bx,
+                current_ground + 1,
+                bz,
+                None,
+                None,
+            );
         }
     }
 }
@@ -373,19 +414,27 @@ mod tests {
         assert!(names.contains(&"minecraft:grass_block".to_string()));
         assert!(!names.iter().any(|n| n == "minecraft:rail"));
 
-        // Track A (x=16, z=8..40) crosses chunk (1,0).
+        // Track A (x=16, z=8..40) is a straight N-S at-grade rail: stage 2
+        // makes it a Create track (`shape=zo`), gravel bed kept.
         let names = read_chunk(&world, 1, 0);
-        assert!(names.contains(&"minecraft:rail".to_string()));
+        assert!(names.contains(&"create:track".to_string()));
+        assert!(!names.iter().any(|n| n == "minecraft:rail"));
         assert!(names.contains(&"minecraft:gravel".to_string()));
 
-        // Track C corner (48,24) is in chunk (3,1).
+        // Track C corner (48,24) is in chunk (3,1). Stage 2 has no corner:
+        // the cell keeps the first segment's straight shape (`zo`) and the
+        // E-W arm starts at (49,24) — both arms are complete straight Create
+        // tracks, the corner joint stays broken until stage 3.
         let names = read_chunk(&world, 3, 1);
-        assert!(names.contains(&"minecraft:rail".to_string()));
+        assert!(names.contains(&"create:track".to_string()));
+        assert!(!names.iter().any(|n| n == "minecraft:rail"));
 
-        // Track D slope (96,48..64) crosses the plateau: chunk (6,3) has
-        // stone, gravel and rails.
+        // Track D (96,48..64) crosses the plateau edge: the single ascending
+        // cell stays a vanilla rail (stage 4), the flat cells are Create
+        // tracks; chunk (6,3) has stone, gravel and both.
         let names = read_chunk(&world, 6, 3);
         assert!(names.contains(&"minecraft:rail".to_string()));
+        assert!(names.contains(&"create:track".to_string()));
         assert!(names.contains(&"minecraft:stone".to_string()));
         assert!(names.contains(&"minecraft:gravel".to_string()));
     }
@@ -408,5 +457,20 @@ mod tests {
         let shapes = chunk_create_track_shapes(&nbt);
         assert!(shapes.contains(&"xo".to_string()));
         assert!(shapes.contains(&"zo".to_string()));
+    }
+
+    #[test]
+    fn create_track_line_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let world_dir = dir.path().join("create-track-test");
+        let world = generate(&world_dir).unwrap();
+
+        // The straight Create track line at x=30, z=20..44 (`shape=zo`) spans
+        // chunks (1,1) and (1,2). It must appear in the palette as
+        // `create:track` so a carriage can ride it end-to-end in-game.
+        let names = read_chunk(&world, 1, 1);
+        assert!(names.contains(&"create:track".to_string()));
+        let names = read_chunk(&world, 1, 2);
+        assert!(names.contains(&"create:track".to_string()));
     }
 }

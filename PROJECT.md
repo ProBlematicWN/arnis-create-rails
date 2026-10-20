@@ -22,11 +22,37 @@
 
 ## Текущее состояние форка
 
-- Базовый коммит: `ab80293d` (апстрим, ветка `create-rails`), локальных изменений кода ещё нет.
-- Исследование оформлено в `NOTES.md`; план работ — в `ROADMAP.md`.
-- `docs/create_track_samples.md` в репозитории **нет** — формат NBT описан по исходникам Create.
+- Базовый коммит: `ab80293d` (апстрим, ветка `create-rails`).
+- **Сделано (этапы 0–1 ROADMAP, проверено в игре):**
+  - **Тестовый стенд** — `src/track_test_world.rs` + скрытый аргумент
+    `--track-test-world=/path/to/saves/world`: детерминированный мини-мир
+    128×128 (один Anvil-регион), тестовые рельсы (прямые N-S/E-W, поворот,
+    уклон) + блоки `create:track` (одиночные `(10,10)` `xo`,
+    `(12,12)` `zo` и прямая линия x=30, z=20..44 `shape=zo`). Не зависит от
+    OSM-данных. С этапа 2 прямые сегменты стенда — это `create:track`
+    (см. ниже), поворот/уклон — ванильные.
+  - **Инфраструктура (блок мода в палитре)** — `block_definitions.rs`:
+    `CREATE_TRACK` (ID 487) / `CREATE_FAKE_TRACK` (ID 488);
+    `Block::namespace()` → `create` (для 487/488), `try_name()` →
+    `track`/`fake_track`; хелпер `create_track_shape(shape)` (compound
+    `{"shape": ...}`). Один ID `CREATE_TRACK` несёт все формы через свойство
+    `shape` (палитра ключит записи по `(блок, свойства)`).
+  - **Проверено в игре** (MC 1.21.1 + Create 6.0.10): блоки `create:track`
+    (`shape=zo`/`xo`, `turn=false`, `waterlogged=false`, без BE) рендерятся
+    как треки и **функциональны** — Create-вагонетка едет по прямой линии
+    (x=30, z=20..44) от конца до конца. Т.е. трек с `turn=false` — настоящий
+    трек, не декоративный; BE не нужен.
+- **Сделано (этап 2 ROADMAP, ожидает проверки в игре):** at-grade прямые
+  рельсы теперь `create:track` (`shape=zo`/`xo`, `turn=false`, BE не
+  пишется) — маппинг `at_grade_rail_props` (`railways.rs`), используется и
+  пайплайном, и тестовым миром; уклоны/повороты пока ванильные
+  (этапы 3–4). Поворот (48,24) в тестовом мире: как в пайплайне, ячейка
+  хранит форму первого сегмента (`zo`), стык в повороте сломан до этапа 3.
+- Исследование — `NOTES.md`; план работ — `ROADMAP.md`.
+- `docs/create_track_samples.md` в репозитории **нет** — формат NBT описан по
+  исходникам Create + blockstate JSON установленного мода (ground truth).
 
-## Как Arnis обрабатывает рельсы (upstream, без изменений)
+## Как Arnis обрабатывает рельсы (upstream-архитектура)
 
 Точка входа — `generate_railways` (`src/element_processing/railways.rs:73`):
 
@@ -52,7 +78,12 @@
 состояния). Block entity для рельсов Arnis не пишет — всё состояние закодировано
 в выборе блока.
 
-## Как Arnis пишет мир (upstream, без изменений)
+> **Изменения форка (этап 2):** `generate_at_grade_rail` пишет рельсы через
+> `at_grade_rail_props`: прямые (`RAIL_NORTH_SOUTH`/`RAIL_EAST_WEST`) →
+> `CREATE_TRACK` + `shape` (`zo`/`xo`); уклоны/повороты пока ванильные
+> (этапы 3–4). Диспетчеризация, логика уклона, диагонали — не изменены.
+
+## Как Arnis пишет мир
 
 Модуль `src/world_editor/` (`mod.rs`, `common.rs`, `java.rs`, `bedrock.rs`, `luanti.rs`):
 
@@ -62,20 +93,21 @@
 - Вставка BE: `insert_block_entity` (`mod.rs:1358`) — **уже обобщённая**: принимает
   произвольный NBT-компound (в т.ч. `id` с любым namespace) и кладёт его в список
   `block_entities` чанка. Пример использования — `set_bed_block_entity_absolute`.
-- Запись блоков: `set_block` / `set_block_absolute` / `set_block_with_properties_absolute`
-  (`mod.rs:2038/2067/2099`). Свойства состояния блока (state properties) уже
+- Запись блоков: `set_block` / `set_block_with_properties` (Y-офсет от земли) /
+  `set_block_absolute` / `set_block_with_properties_absolute`
+  (`mod.rs:2038/2069/2093/2125`). Свойства состояния блока (state properties)
   поддерживаются: `BlockWithProperties { block, properties: Option<Arc<Value>> }`
   (`src/block_definitions.rs:59`).
 - Палитра пишется как `format!("{}:{}", block.namespace(), block.name())`
-  (`common.rs:779`), где `Block::namespace()` **жёстко возвращает `"minecraft"`**
-  (`block_definitions.rs:102-104`).
+  (`common.rs:779`); `Block::namespace()` зависит от ID: 487/488 → `create`,
+  остальные → `minecraft` (**этап 1**, `block_definitions.rs:102`).
 - `Block { id: u16 }` — блок идентифицируется только числовым ID; палитра
   сериализуется в `common.rs:777` и `java.rs:1386`.
 
 Ключевой вывод: путь «блок + свойства состояния» существует
 (`set_block_with_properties_absolute`), путь «BE произвольного типа» существует
-(`insert_block_entity`). **Не хватает только имени блока мода** — `create:track`
-нельзя выразить, пока `namespace()` жёстко `minecraft`.
+(`insert_block_entity`), имена модов работают (`namespace()` зависит от ID —
+этап 1).
 
 ## Формат Create track (Create 6.0.10+mc1.21.1)
 
@@ -84,8 +116,11 @@
 - Block entity: `create:track` — существует **только при `turn=true`**;
   при `turn=false` BE не пишется, всё состояние — в свойствах блока.
 - Свойства состояния блока:
-  - `shape` — `TrackShape` (76 вариантов: straight/curved/junction/crossing ×
-    направления × up/down; полный список — в `NOTES.md` §3);
+  - `shape` — `TrackShape` (**19 значений** в 6.0.10: `zo`/`xo` прямые,
+    `pd`/`nd` диагонали, `an/as/ae/aw` уклоны, `tn/ts/te/tw` телепорт,
+    `cr_o`/`cr_d`/`cr_pdx`/`cr_pdz`/`cr_ndx`/`cr_ndz` пересечения, `none`;
+    полный список — в `NOTES.md` §3). Блокстейт-JSON: 76 вариантов =
+    19 shape × 2 `turn` × 2 `waterlogged`; модель зависит только от `shape`.
   - `turn` — bool, true = кривая с сглаживанием (наличие BE);
   - `waterlogged` — bool.
 - `TrackShape` несёт оси и направления концов (`getStart`/`getEnd`, `getUp`/`getDown`)
@@ -124,15 +159,17 @@
 
 ## Что нужно изменить в Arnis (diff от upstream)
 
-1. **Имя блока мода** — расширить `Block` (или добавить отдельный путь записи),
-   чтобы палитра могла содержать `create:track` / `create:fake_track`:
-   `Block::namespace()` перестать возвращать жёсткое `"minecraft"`
-   (либо зарезервировать ID и специализировать `try_name()`/`namespace()`).
-2. **Константы блоков** — новые ID `CREATE_TRACK`, `CREATE_FAKE_TRACK`
-   в `src/block_definitions.rs` (аналог `RAIL_*`).
+1. ~~**Имя блока мода**~~ — **сделано (этап 1)**: `Block::namespace()` →
+   `create` для ID 487/488, `try_name()` → `track`/`fake_track`; палитра
+   содержит `create:track` / `create:fake_track`.
+2. ~~**Константы блоков**~~ — **сделано (этап 1)**: `CREATE_TRACK` (487),
+   `CREATE_FAKE_TRACK` (488) в `src/block_definitions.rs`.
 3. **Генерация** — в `railways.rs` заменить выбор `RAIL_*` на выбор
    `CREATE_TRACK` + свойства состояния (`shape`, `turn`, `waterlogged`)
    через `set_block_with_properties_absolute`.
+   **Частично сделано (этап 2):** at-grade прямые → `CREATE_TRACK` +
+   `shape` (`zo`/`xo`) через `at_grade_rail_props`; кривые (этап 3),
+   уклоны (этап 4), туннели/мосты (этап 6) — пока ванильные.
 4. **BE для сглаженных кривых** — новый `set_create_track_block_entity_absolute`
    (аналог `set_bed_block_entity_absolute`), пишущий `Connections`/`Smoothing`/
    `BoundLocation`/`BoundDimension` через существующий `insert_block_entity`.
@@ -152,6 +189,7 @@
 - **`validateConnections`** — если `Connections` не согласованы с формой,
   Create пересчитает/очистит данные; нужно решить, писать идеальные данные
   или полагаться на пересчёт (проверить в игре).
-- **Namespace** — жёсткий `"minecraft"` требует расширения (п. 1 diff).
+- ~~**Namespace** — жёсткий `"minecraft"`~~ — **решено (этап 1)**:
+  `Block::namespace()`/`try_name()` зависят от ID (487/488 → `create`).
 - Версии данных совпадают (3955 = MC 1.21.1 = Create 6.0.10+mc1.21.1) —
   рассинхронизация маловероятна.
