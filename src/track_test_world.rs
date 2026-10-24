@@ -83,6 +83,28 @@ const SPAWN: (i32, i32, i32) = (20, -61, 16);
 /// `(x, z, shape)` — `xo` is the east–west straight, `zo` the north–south one.
 const CREATE_TRACKS: &[(i32, i32, &str)] = &[(10, 10, "xo"), (12, 12, "zo")];
 
+/// Quarter-turn curves for the Create curve primitives: circle centre, the
+/// directions the two straights run in, and the radius (one radius differs from
+/// the reference 8 to exercise the general handle length).
+const CURVE_TURNS: &[(i32, i32, i32, i32, i32)] = &[
+    (10, 64, 1, 1, 8),
+    (30, 64, -1, 1, 8),
+    (10, 92, 1, -1, 8),
+    (30, 92, -1, -1, 8),
+    (52, 64, 1, 1, 12),
+];
+
+/// Create slopes as (fixed coordinate, start of the run, run, rise); the run
+/// sign picks the travel direction, so positive and negative runs give uphill
+/// and downhill passes. Rise other than 1 exercises other steepness ratios.
+const CURVE_SLOPES_Z: &[(i32, i32, i32, i32)] = &[
+    (60, 64, 5, 1),
+    (70, 64, 3, 1),
+    (80, 64, 8, 1),
+    (60, 92, -5, 1),
+];
+const CURVE_SLOPES_X: &[(i32, i32, i32, i32)] = &[(100, 60, 5, 1), (104, 20, -3, 2)];
+
 /// A straight north–south line of `create:track` blocks (`shape=zo`), for the
 /// in-game compatibility check: is a generated track a *functional* Create
 /// track (a carriage rides it end-to-end) or just a decorative block? Placed
@@ -160,6 +182,38 @@ pub fn generate(world_dir: &Path) -> Result<PathBuf, String> {
             None,
             None,
         );
+    }
+
+    // 4d. Create curves: quarter turns in all four rotations, one larger
+    //     radius, and slopes along both axes at three steepness ratios. These
+    //     go through `emit_create_curve`, the same primitive the OSM pipeline
+    //     uses, so the in-game drive test also covers the pipeline output.
+    for t in CURVE_TURNS {
+        let (cx, cz, sx, sz, r) = *t;
+        let a = (cx + sx * r, GROUND_LEVEL + 1, cz);
+        let b = (cx, GROUND_LEVEL + 1, cz + sz * r);
+        editor.emit_create_curve(
+            a,
+            b,
+            "xo",
+            "zo",
+            (-sx as f64, 0.0, 0.0),
+            (0.0, 0.0, -sz as f64),
+        );
+    }
+    for t in CURVE_SLOPES_Z {
+        let (x, z, run, rise) = *t;
+        let a = (x, GROUND_LEVEL + 1, z);
+        let b = (x, GROUND_LEVEL + 1 + rise, z + run);
+        let s = if run >= 0 { 1.0 } else { -1.0 };
+        editor.emit_create_curve(a, b, "zo", "zo", (0.0, 0.0, s), (0.0, 0.0, -s));
+    }
+    for t in CURVE_SLOPES_X {
+        let (z, x, run, rise) = *t;
+        let a = (x, GROUND_LEVEL + 1, z);
+        let b = (x + run, GROUND_LEVEL + 1 + rise, z);
+        let s = if run >= 0 { 1.0 } else { -1.0 };
+        editor.emit_create_curve(a, b, "xo", "xo", (s, 0.0, 0.0), (-s, 0.0, 0.0));
     }
 
     // 5. Flat ground, raised mesa.
@@ -429,11 +483,11 @@ mod tests {
         assert!(names.contains(&"create:track".to_string()));
         assert!(!names.iter().any(|n| n == "minecraft:rail"));
 
-        // Track D (96,48..64) crosses the plateau edge: the single ascending
-        // cell stays a vanilla rail (stage 4), the flat cells are Create
-        // tracks; chunk (6,3) has stone, gravel and both.
+        // Track D (96,48..64) crosses the plateau edge: the ascending cell is
+        // now a Create track too (the pipeline never writes vanilla rails again;
+        // smoothed ascents come from `plan_create_curves` on real OSM ways).
         let names = read_chunk(&world, 6, 3);
-        assert!(names.contains(&"minecraft:rail".to_string()));
+        assert!(!names.iter().any(|n| n == "minecraft:rail"));
         assert!(names.contains(&"create:track".to_string()));
         assert!(names.contains(&"minecraft:stone".to_string()));
         assert!(names.contains(&"minecraft:gravel".to_string()));
@@ -472,5 +526,20 @@ mod tests {
         assert!(names.contains(&"create:track".to_string()));
         let names = read_chunk(&world, 1, 2);
         assert!(names.contains(&"create:track".to_string()));
+    }
+
+    #[test]
+    fn create_curves_write_fake_track_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let world_dir = dir.path().join("create-track-test");
+        let world = generate(&world_dir).unwrap();
+
+        // The quarter turns sit at circle centres (10,64), (30,64), (10,92),
+        // (30,92) with radius 8 and (52,64) with radius 12, so their fake_track
+        // chains land in chunks (0..3, 4..5). A smoothed curve must paint fake
+        // track between its anchors, otherwise a carriage would derail in-game.
+        assert!(read_chunk(&world, 1, 4).contains(&"create:fake_track".to_string()));
+        assert!(read_chunk(&world, 1, 5).contains(&"create:fake_track".to_string()));
+        assert!(read_chunk(&world, 3, 4).contains(&"create:fake_track".to_string()));
     }
 }

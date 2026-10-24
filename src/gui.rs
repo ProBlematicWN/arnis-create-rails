@@ -1706,6 +1706,7 @@ fn gui_start_generation(
                 projection: crate::projection::ProjectionKind::Local,
                 one_world: false,
                 world_name: None,
+                track_test_world: None,
                 one_world_run: None,
                 ground_level,
                 mode: if skip_osm_objects {

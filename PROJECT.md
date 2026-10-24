@@ -5,7 +5,8 @@
 Форк [Arnis](https://github.com/louis-e/arnis) (Rust, генерация мира Minecraft из данных OSM).
 Цель форка: вместо ванильных рельсов (`railway=rail` → `minecraft:rail`) ставить рельсы мода
 **Create** — блок `create:track` с корректными block entity данными соединений
-(`create:track` BE: `Connections`, `Smoothing`, `BoundLocation`, `BoundDimension`).
+(`create:track` BE: только `Connections`; `Smoothing`/`BoundLocation`/
+`BoundDimension` в данных 6.0.10 отсутствуют).
 
 Итог: сгенерированный Arnis-мир открывается в Minecraft с установленным Create,
 рельсы — это треки Create, по которым ходят вагонетки Create.
@@ -23,7 +24,7 @@
 ## Текущее состояние форка
 
 - Базовый коммит: `ab80293d` (апстрим, ветка `create-rails`).
-- **Сделано (этапы 0–1 ROADMAP, проверено в игре):**
+- **Done (stages 0-1, verified in game):**
   - **Тестовый стенд** — `src/track_test_world.rs` + скрытый аргумент
     `--track-test-world=/path/to/saves/world`: детерминированный мини-мир
     128×128 (один Anvil-регион), тестовые рельсы (прямые N-S/E-W, поворот,
@@ -42,7 +43,7 @@
     как треки и **функциональны** — Create-вагонетка едет по прямой линии
     (x=30, z=20..44) от конца до конца. Т.е. трек с `turn=false` — настоящий
     трек, не декоративный; BE не нужен.
-- **Сделано (этап 2 ROADMAP, ожидает проверки в игре):** at-grade прямые
+- **Done (stage 2): at-grade straight rails** are `create:track` (`shape=zo`/`xo`,
   рельсы теперь `create:track` (`shape=zo`/`xo`, `turn=false`, BE не
   пишется) — маппинг `at_grade_rail_props` (`railways.rs`), используется и
   пайплайном, и тестовым миром; уклоны/повороты пока ванильные
@@ -125,14 +126,18 @@
   - `waterlogged` — bool.
 - `TrackShape` несёт оси и направления концов (`getStart`/`getEnd`, `getUp`/`getDown`)
   — по форме определяются соседние блоки и геометрия.
-- Структура BE `TrackBlockEntity` (NBT):
-  - `Connections` — список `BezierConnection`, по одному на ветвь;
-  - `Smoothing` — число, качество сглаживания;
-  - `BoundLocation` — локация привязки;
-  - `BoundDimension` — измерение привязки.
-- `BezierConnection` (на ветвь): `Girder`, `Primary` (bool), `Positions`,
-  `Starts`, `Axes`, `Normals`, `Material` (`TrackMaterial`, по умолчанию
-  `ANDESITE`), `Smoothing`. Позиции **относительные** — от позиции блока.
+- Структура BE `TrackBlockEntity` (NBT) — **подтверждено дампом вайварда**:
+  стандартные `id,x,y,z` (Int, абс.), `keepPacked` (Byte 0) +
+  `Connections` (List<Compound>). **В данных НЕТ** `Smoothing`/
+  `BoundLocation`/`BoundDimension`.
+- `BezierConnection` (на ветвь, типы подтверждены): `Positions`
+  (2×`{Pos: IntArray[3]}`), `Starts`/`Axes`/`Normals` (2×`{V: List<Double>[3]}`),
+  `Material` (String `"create:andesite"`), `Girder` (Byte 0), `Primary`
+  (Byte 0/1). Позиции/векторы **относительные** — от позиции якоря.
+- **Кривая (поворот и уклон)** = 2 якорных `create:track` (`turn=true`) на
+  концах + цепочка `create:fake_track` (тело дуги, минимальный BE).
+  `Connections` симметричен на обоих якорях. Подробности и примеры —
+  `NOTES.md` §3.
 - Инвариант `validateConnections`: при загрузке/смене формы Create проверяет
   согласованность `Connections` с формой и соседями; при нарушении —
   пересчёт/очистка.
@@ -149,13 +154,11 @@
 | `shape` | направление (prev→current→next) + уклон (высоты prev/current/next) | только геометрии |
 | `turn` | `false` для straight/junction/crossing и «жёстких» кривых; `true` только для сглаженных кривых | решения генератора |
 | `waterlogged` | `false` (или по данным воды) | окружения |
-| BE `Connections` | по одному `BezierConnection` на ветвь (curved — 2, junction — 3, crossing — 2): `Girder`, `Primary`, `Positions`, `Starts`, `Axes`, `Normals`, `Material`, `Smoothing`; позиции относительные | формы + соседей |
-| BE `Smoothing` | константа генератора (настраивается) | — |
-| BE `BoundLocation` / `BoundDimension` | `(x, y, z)` блока / `minecraft:overworld` | координаты |
+| BE `Connections` | по одному `BezierConnection` на ветвь: `Positions` (2×`{Pos:IntArray[3]}`), `Starts`/`Axes`/`Normals` (2×`{V:List<Double>[3]}`), `Material` (`"create:andesite"`), `Girder` (0), `Primary` (0/1); позиции/векторы относительные, симметрия на обоих якорях | якоря + соседей |
 
-Критическое упрощение: **пока `turn=false`, block entity не нужны вообще** —
-мир полностью описывается состояниями блоков, и `getConnected` работает
-только по осям формы. BE появляются только на сглаженных кривых.
+Критическое упрощение: **прямые (`turn=false`) — без BE**; кривые (поворот/уклон)
+— 2 якоря `turn=true` (BE `Connections`) + `fake_track` (минимальный BE).
+`Smoothing`/`BoundLocation`/`BoundDimension` в данных 6.0.10 отсутствуют.
 
 ## Что нужно изменить в Arnis (diff от upstream)
 
@@ -164,28 +167,30 @@
    содержит `create:track` / `create:fake_track`.
 2. ~~**Константы блоков**~~ — **сделано (этап 1)**: `CREATE_TRACK` (487),
    `CREATE_FAKE_TRACK` (488) в `src/block_definitions.rs`.
-3. **Генерация** — в `railways.rs` заменить выбор `RAIL_*` на выбор
-   `CREATE_TRACK` + свойства состояния (`shape`, `turn`, `waterlogged`)
-   через `set_block_with_properties_absolute`.
-   **Частично сделано (этап 2):** at-grade прямые → `CREATE_TRACK` +
-   `shape` (`zo`/`xo`) через `at_grade_rail_props`; кривые (этап 3),
-   уклоны (этап 4), туннели/мосты (этап 6) — пока ванильные.
-4. **BE для сглаженных кривых** — новый `set_create_track_block_entity_absolute`
-   (аналог `set_bed_block_entity_absolute`), пишущий `Connections`/`Smoothing`/
-   `BoundLocation`/`BoundDimension` через существующий `insert_block_entity`.
+3. **Генерация** — DONE. Every rail state goes through `RailKind` -> `CREATE_TRACK` + `shape`.
+   Rail topology comes from NODE GEOMETRY (`way_nodes_cells` -> `simplify_leg_nodes`
+   (Douglas-Peucker) -> `plan_create_legs`); the per-cell rasterization feeds the track BED
+   only — a rasterized diagonal is a staircase of `xo`/`zo` that Create cannot connect.
+
+4. **BE для кривых** — DONE: `set_create_track_block_entity_absolute` writes `Connections`;
+   `emit_create_curve`/`create_curve_emission`/`create_curve_cells` write the mirrored anchor
+   pair and the `create:fake_track` chain. Handle law in code: `h = max(3.5, 7/16 * span)`
+   (Create uses `r*(4/3)*tan(theta/4)` from the CORNER radius — still to be matched).
+
 5. **`fake_track`** — по необходимости (проверить в игре, см. риски).
 
 Формат записи (Anvil, палитры, `block_entities`) менять не нужно.
 
 ## Риски и открытые вопросы
 
-- **Имена полей NBT для Vec3** (catnip `VecHelper.writeNBTCompound`) не
-  подтверждены: вероятно `{x, y, z}` double — проверить по дампам вайварда
-  (поставить трек в игре → сохранить → прочитать NBT).
-- **Исходники catnip недоступны** — часть полей NBT (векторы, списки позиций)
-  выведена по косвенным признакам.
-- **`fake_track`** — семантика размещения (когда и куда ставится) не подтверждена;
-  проверить в игре.
+- ~~**Имена полей NBT для Vec3** не подтверждены~~ — **решено (дамп вайварда)**:
+  `V`=List<Double>[3], `Pos`=IntArray[3] (compound с полем `V`/`Pos`).
+- ~~**Исходники catnip недоступны** — часть полей NBT выведена косвенно~~ —
+  структура `BezierConnection` и типы подтверждены дампом вайварда
+  (`NOTES.md` §3).
+- ~~**`fake_track`** — семантика размещения не подтверждена~~ — **решено**:
+  тело кривой (промежуточные точки дуги), минимальный BE `{id,x,y,z,keepPacked}`,
+  ставится между двумя якорями `turn=true`.
 - **`validateConnections`** — если `Connections` не согласованы с формой,
   Create пересчитает/очистит данные; нужно решить, писать идеальные данные
   или полагаться на пересчёт (проверить в игре).
@@ -193,3 +198,27 @@
   `Block::namespace()`/`try_name()` зависят от ID (487/488 → `create`).
 - Версии данных совпадают (3955 = MC 1.21.1 = Create 6.0.10+mc1.21.1) —
   рассинхронизация маловероятна.
+
+## Итог implementation (what exists in the fork today)
+
+- `src/block_definitions.rs`: `CREATE_TRACK`(487)/`CREATE_FAKE_TRACK`(488),
+  `create_track_shape(shape)`, `create_track_props(shape, turn)` (`turn` written only when true).
+- `src/world_editor/mod.rs`: `set_create_track_block_entity_absolute`, `emit_create_curve`,
+  `create_curve_emission`, `create_curve_cells`, `curve_start`. Chain rules: unit-arc-length
+  sampling; cell = `(floor x, ceil(y-1e-9), floor z)`; dedupe CONSECUTIVE duplicates only
+  (a global `out.contains` deletes real cells of a Bezier overshoot); anchor cells skipped by
+  the caller; a chain cell never overwrites a cell that holds `create:track` (the `create:fake_track`
+  block + `Some(&[])` entity clear would delete the other curve's `Connections`).
+- `src/element_processing/railways.rs`: `RailKind` replaces all vanilla rail IDs;
+  `way_nodes_cells` -> `simplify_leg_nodes` -> `plan_create_legs` -> `emit_create_curve`;
+  straights/slopes keep upstream direction + slope logic (`determine_rail_with_slope`),
+  ascending shapes `an/as/ae/aw`, and stay `turn=false` (no BE).
+  Constants: `CREATE_TURN_BACKOFF=8`, `CREATE_LEG_TOLERANCE=1.5`, `CREATE_SNAP_TOL=0.09`
+  (~5 deg axis/45° snap window), `CREATE_MAX_SPAN=14`, `CREATE_MAX_RUN_LEGS=3`.
+- `src/track_test_world.rs` (`--track-test-world`): deterministic reference curves
+  (turns r=8/12, slopes 1-in-3/5/8, both axes) — the axis-aligned system that reproduces the
+  hand-built reference chains; `plan_create_legs` generalizes it to arbitrary OSM geometry.
+- Verification: `cargo build` clean; `cargo test railways::tests` 14/0; full `cargo test`
+  fails only `map_transformation::translate::translator::tests::test_translate_by_vector`
+  (needs internet). Real-OSM worlds are validated by `tools/check_curves_be.py`; IN GAME they
+  are still NOT verified — `in-game-harness` = FAILED until the user drives a generated world.

@@ -1623,6 +1623,21 @@ pub fn create_track_shape(shape: &str) -> Value {
     )]))
 }
 
+/// Block-state properties of a `create:track` block: `shape` plus `turn`.
+///
+/// `turn` is `true` only for the anchors of a smoothed curve, which are the
+/// only `create:track` blocks that carry a block entity (NOTES.md §3, verified
+/// against `assets/create/blockstates/track.json` of the installed mod: the
+/// property serializes as the strings `true`/`false`, `false` being the
+/// default and therefore omitted).
+pub fn create_track_props(shape: &str, turn: bool) -> Value {
+    let mut props = HashMap::from([("shape".to_string(), Value::String(shape.to_string()))]);
+    if turn {
+        props.insert("turn".to_string(), Value::String("true".to_string()));
+    }
+    Value::Compound(props)
+}
+
 /// Maps a block to a stair variant in the same colour family.
 #[inline]
 pub fn get_stair_block_for_material(material: Block) -> Block {

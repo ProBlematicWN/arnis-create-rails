@@ -82,3 +82,8 @@ gen/
 
 # Working notes for coding agents, not part of the project.
 /CLAUDE.md
+map.osm
+CODE_OF_CONDUCT.md
+tmp/
+docs/
+.pi/

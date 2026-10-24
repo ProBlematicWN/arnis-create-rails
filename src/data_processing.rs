@@ -1022,6 +1022,13 @@ pub fn generate_world_with_options(
     // Rail centerlines, used to keep catenary masts off neighbouring tracks.
     let rail_mask = railways::collect_at_grade_rail_mask(&elements, &xzbbox);
 
+    // Create rail corridors must be declared before ANY tile runs: tiles lay
+    // rails in parallel with other tiles' ground passes, so a corridor claimed
+    // only at rail-write time can be paved shut by a neighbour tile that never
+    // saw it, and the merged cleanup cannot write regions already streamed to
+    // disk. The presurvey arms the write guard for the whole run.
+    railways::presurvey_create_corridors(&mut editor, &elements);
+
     let tunnel_internal_endpoints = highways::collect_tunnel_internal_endpoints(&elements, &xzbbox);
 
     // Tunnel bore footprints, so the water depth-carve and vegetation stay off them.
@@ -1142,6 +1149,10 @@ pub fn generate_world_with_options(
     // Decide between sequential and parallel processing based on world size.
     // Tile subdivision is aligned to 512-block Minecraft region boundaries.
     let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
+
+    // One Create rail report for the whole run: the main editor and every tile
+    // editor share it, so the sidecars `save()` writes cover every tile.
+    let rails_report = editor.create_rails_report();
 
     // Tile editors are created as JavaAnvil (WorldEditor::new), so their
     // format-dependent block-entity schema (banners) only matches Java output.
@@ -1302,6 +1313,10 @@ pub fn generate_world_with_options(
             if let Some(cars) = &car_network {
                 tile_editor.set_car_network(Arc::clone(cars));
             }
+            // The Create rail planner records what each OSM way was meant to cover
+            // and which connections its validator refused; tile editors share the
+            // main editor's report so one run writes one sidecar pair.
+            tile_editor.set_create_rails(Arc::clone(&rails_report));
             tile_editor.set_strict_bounds(
                 tile_bounds.min_x,
                 tile_bounds.min_z,
@@ -1430,6 +1445,11 @@ pub fn generate_world_with_options(
                 );
             }
 
+            // Re-open the corridors once this tile's terrain exists: whatever the
+            // generator, the carver or the decorator put inside a declared crossing
+            // track gets dug out, so the train never drives inside a hill.
+            crate::element_processing::railways::clear_create_corridors(&mut tile_editor);
+
             let tile_road_overrides = tile_editor.take_road_surface_overrides();
 
             // Emit on whole-percent steps only; the monotonic clamp
@@ -1515,6 +1535,11 @@ pub fn generate_world_with_options(
                             tiles[tile_idx].max_x - 1,
                             tiles[tile_idx].max_z - 1,
                         );
+                        // A merge can reintroduce blocks into corridor cells
+                        // (prior tiles' halo data fills the AIR the guard left
+                        // in the owner's store) - re-open the corridors now,
+                        // BEFORE any of this tile's regions stream to disk.
+                        railways::sweep_create_corridors_after_merge(&mut editor);
                         // Carry road-surface overrides to the main editor so the post-merge 3D-model
                         // pass stays road-aware. Under eviction keep only the deferred 3D regions'
                         // overrides (the rest are evicted; this caps the extra resident RAM).
@@ -1829,6 +1854,17 @@ pub fn generate_world_with_options(
         bench.report("landmark_place", t.elapsed());
     }
     bench.mark("post_passes");
+
+    // Corridors: one final pass now that every terrain, cave, water, structure,
+    // model and decoration write has landed. The per-tile pass already
+    // re-opened the corridors after that tile's ground pass and the write guard
+    // keeps every later editor write out of a declared corridor cell; this
+    // cleans what still slipped in (earlier tiles' terrain under a parallel
+    // tile's rails, bulk write paths the guard does not see), and it is the
+    // last moment resident regions are writable - under eviction everything
+    // else is already streamed to disk.
+    crate::element_processing::railways::clear_create_corridors(&mut editor);
+    bench.mark("corridor_clear");
 
     if eviction_active {
         // Flush deferred (rail-tunnel-touched) regions now the global carve has run on them.

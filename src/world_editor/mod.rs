@@ -267,6 +267,9 @@ pub struct WorldEditor<'a> {
     /// Strict (non-halo) bounds of a tile editor: min_x, min_z, max_x, max_z inclusive.
     /// None for the main editor, which owns everything.
     strict_bounds: Option<(i32, i32, i32, i32)>,
+    /// What the Create rail planner decided: the cells each OSM railway way was
+    /// meant to cover, and the connections its pre-write validator refused.
+    create_rails: Arc<crate::element_processing::railways::CreateRailReport>,
     /// Cells holding a decal frame. Frames are entities, so `set_block` reads them as empty.
     frame_cells: FnvHashSet<(i32, i32, i32)>,
     /// Set for a One World run: merge into the world's existing regions.
@@ -317,6 +320,7 @@ impl<'a> WorldEditor<'a> {
             signage: None,
             traffic_signals: None,
             car_network: None,
+            create_rails: Arc::new(crate::element_processing::railways::CreateRailReport::new()),
             strict_bounds: None,
             frame_cells: FnvHashSet::default(),
             merge_into_existing: None,
@@ -372,6 +376,7 @@ impl<'a> WorldEditor<'a> {
             signage: None,
             traffic_signals: None,
             car_network: None,
+            create_rails: Arc::new(crate::element_processing::railways::CreateRailReport::new()),
             strict_bounds: None,
             frame_cells: FnvHashSet::default(),
             merge_into_existing: None,
@@ -427,6 +432,7 @@ impl<'a> WorldEditor<'a> {
             signage: None,
             traffic_signals: None,
             car_network: None,
+            create_rails: Arc::new(crate::element_processing::railways::CreateRailReport::new()),
             strict_bounds: None,
             frame_cells: FnvHashSet::default(),
             merge_into_existing: None,
@@ -703,6 +709,21 @@ impl<'a> WorldEditor<'a> {
 
     pub fn car_network(&self) -> Option<Arc<crate::element_processing::cars::CarNetwork>> {
         self.car_network.clone()
+    }
+
+    /// What the Create rail planner decided, shared with the tile editors.
+    pub fn create_rails_report(
+        &self,
+    ) -> Arc<crate::element_processing::railways::CreateRailReport> {
+        Arc::clone(&self.create_rails)
+    }
+
+    /// Tile editors share the main editor's rail report so one run writes one sidecar.
+    pub fn set_create_rails(
+        &mut self,
+        report: Arc<crate::element_processing::railways::CreateRailReport>,
+    ) {
+        self.create_rails = Arc::clone(&report)
     }
 
     /// The signage context, if decals are enabled and a registry was built.
@@ -1435,6 +1456,181 @@ impl<'a> WorldEditor<'a> {
         self.insert_block_entity(x, z, be);
     }
 
+    /// One Create curve: both anchors (`create:track` with `turn=true` plus a
+    /// `Connections` block entity, written mirrored on each end) and the
+    /// `create:fake_track` chain between them.
+    ///
+    /// `axes_a`/`axes_b` are the unit tangents at each anchor pointing INTO the
+    /// curve; `shape_a`/`shape_b` are the `TrackShape` names of the straight
+    /// that continues at that end (`xo`/`zo`). Curve geometry follows NOTES.md
+    /// §5, fitted against the hand-built reference world `track-stage2`:
+    /// the chain is the cubic Bezier between the exit-face centres
+    /// (`Start = anchor + (0.5, 0, 0.5) + 0.5 * axis`), walked in unit arc-length
+    /// steps, each step rounded down on X/Z and up on Y.
+    pub fn emit_create_curve(
+        &mut self,
+        a: (i32, i32, i32),
+        b: (i32, i32, i32),
+        shape_a: &str,
+        shape_b: &str,
+        axes_a: (f64, f64, f64),
+        axes_b: (f64, f64, f64),
+    ) {
+        let start_a = curve_start(&a, &axes_a);
+        let start_b = curve_start(&b, &axes_b);
+
+        for (anchor, shape, axes_other, axes_self, primary) in [
+            (&a, shape_a, &axes_b, &axes_a, 0),
+            (&b, shape_b, &axes_a, &axes_b, 1),
+        ] {
+            // A previous span's chain may already pave this cell with `create:fake_track`
+            // (its chain overshoots, and OSM ways overlap): the fake is disposable
+            // filler, so allow the replacement. Occupancy by another `create:track`
+            // anchor is rejected by the caller — one cell cannot host two
+            // `Connections`.
+            // A long railway way is planned identically in every tile it crosses,
+            // but each tile writes only what it owns: the neighbouring tile writes
+            // this anchor with the same plan, so claiming-and-not-writing here is
+            // what keeps one `create:track` blockstate and one `Connections` per
+            // cell instead of two competing copies.
+            if !self.owns(anchor.0, anchor.2) {
+                continue;
+            }
+            let props = create_track_props(shape, true);
+            self.set_block_with_properties_absolute(
+                BlockWithProperties::new(CREATE_TRACK, Some(props)),
+                anchor.0,
+                anchor.1,
+                anchor.2,
+                Some(&[CREATE_FAKE_TRACK]),
+                None,
+            );
+            let other = (
+                (if anchor == &a { b.0 - a.0 } else { a.0 - b.0 }),
+                (if anchor == &a { b.1 - a.1 } else { a.1 - b.1 }),
+                (if anchor == &a { b.2 - a.2 } else { a.2 - b.2 }),
+            );
+            self.set_create_track_block_entity_absolute(
+                anchor.0,
+                anchor.1,
+                anchor.2,
+                other,
+                (*axes_self, *axes_other),
+                primary as u8,
+            );
+        }
+
+        for (cx, cy, cz) in create_curve_emission(start_a, start_b, a, b, axes_a, axes_b) {
+            // Never pave over another curve's anchor: a `create:fake_track` block
+            // would replace the `create:track` blockstate AND, because block entities
+            // are deduplicated per exact cell, its `Connections` too, which leaves the
+            // other anchor pointing at a cell that is no longer an anchor.
+            if self.check_for_block_absolute(cx, cy, cz, Some(&[CREATE_TRACK]), None) {
+                continue;
+            }
+            // Same tile rule as the anchors: a chain that runs across a tile seam
+            // is written once per cell, by whichever tile owns that cell.
+            if !self.owns(cx, cz) {
+                continue;
+            }
+            self.set_block_absolute(CREATE_FAKE_TRACK, cx, cy, cz, None, Some(&[]));
+            let mut be: HashMap<String, Value> = HashMap::new();
+            be.insert(
+                "id".to_string(),
+                Value::String("create:fake_track".to_string()),
+            );
+            be.insert("x".to_string(), Value::Int(cx));
+            be.insert("y".to_string(), Value::Int(cy));
+            be.insert("z".to_string(), Value::Int(cz));
+            be.insert("keepPacked".to_string(), Value::Byte(0));
+            self.insert_block_entity(cx, cz, be);
+        }
+    }
+
+    /// Block entity of one `create:track` curve anchor.
+    ///
+    /// Field layout copied from the reference save `track-stage2`
+    /// (`tools/ref_curves_be.json`, NOTES.md §3): `Positions` are relative
+    /// offsets of the two anchors as `{Pos: IntArray[3]}`, `Starts`/`Axes`/
+    /// `Normals` are `{V: List<Double>[3]}`, `Material` a block namespace id,
+    /// `Girder`/`Primary` bytes. There is no `Smoothing`, `BoundLocation` or
+    /// `BoundDimension` in the shipped format.
+    pub fn set_create_track_block_entity_absolute(
+        &mut self,
+        x: i32,
+        absolute_y: i32,
+        z: i32,
+        other: (i32, i32, i32),
+        axes: ((f64, f64, f64), (f64, f64, f64)),
+        primary: u8,
+    ) {
+        let ((ax0, ay0, az0), (ax1, ay1, az1)) = axes;
+        let pos = |dx: i32, dy: i32, dz: i32| -> Value {
+            Value::Compound(HashMap::from([(
+                "Pos".to_string(),
+                Value::IntArray(IntArray::new(vec![dx, dy, dz])),
+            )]))
+        };
+        let vec = |vx: f64, vy: f64, vz: f64| -> Value {
+            Value::Compound(HashMap::from([(
+                "V".to_string(),
+                Value::List(vec![
+                    Value::Double(vx),
+                    Value::Double(vy),
+                    Value::Double(vz),
+                ]),
+            )]))
+        };
+        // Exit-face centre of each anchor, see NOTES.md §5.
+        let start0 = (0.5 + 0.5 * ax0, 0.5 * ay0, 0.5 + 0.5 * az0);
+        let start1 = (
+            other.0 as f64 + 0.5 + 0.5 * ax1,
+            other.1 as f64 + 0.5 * ay1,
+            other.2 as f64 + 0.5 + 0.5 * az1,
+        );
+
+        let connection: HashMap<String, Value> = HashMap::from([
+            (
+                "Positions".to_string(),
+                Value::List(vec![pos(0, 0, 0), pos(other.0, other.1, other.2)]),
+            ),
+            (
+                "Starts".to_string(),
+                Value::List(vec![
+                    vec(start0.0, start0.1, start0.2),
+                    vec(start1.0, start1.1, start1.2),
+                ]),
+            ),
+            (
+                "Axes".to_string(),
+                Value::List(vec![vec(ax0, ay0, az0), vec(ax1, ay1, az1)]),
+            ),
+            (
+                "Normals".to_string(),
+                Value::List(vec![vec(0.0, 1.0, 0.0), vec(0.0, 1.0, 0.0)]),
+            ),
+            (
+                "Material".to_string(),
+                Value::String("create:andesite".to_string()),
+            ),
+            ("Girder".to_string(), Value::Byte(0)),
+            ("Primary".to_string(), Value::Byte(primary as i8)),
+        ]);
+
+        let be: HashMap<String, Value> = HashMap::from([
+            ("id".to_string(), Value::String("create:track".to_string())),
+            ("x".to_string(), Value::Int(x)),
+            ("y".to_string(), Value::Int(absolute_y)),
+            ("z".to_string(), Value::Int(z)),
+            ("keepPacked".to_string(), Value::Byte(0)),
+            (
+                "Connections".to_string(),
+                Value::List(vec![Value::Compound(connection)]),
+            ),
+        ]);
+        self.insert_block_entity(x, z, be);
+    }
+
     /// Preview map in a frame at spawn, with the arnismc.com map one block below.
     pub fn place_map_item_frame(
         &mut self,
@@ -2112,6 +2308,14 @@ impl<'a> WorldEditor<'a> {
         )
     }
 
+    /// True when a declared Create rail corridor owns this absolute cell: the
+    /// rails already lie there, so nothing but Create track may be written into
+    /// it. Cheap false when no Create rails exist (the corridor set is empty).
+    #[inline]
+    pub fn create_corridor_occupied(&self, x: i32, absolute_y: i32, z: i32) -> bool {
+        self.create_rails.corridor_contains((x, absolute_y, z))
+    }
+
     /// True if the region at these block coords was already streamed to disk and evicted.
     /// Writers must drop such writes, or they resurrect the region and the final save
     /// truncates the real on-disk data. Short-circuits when nothing has been evicted.
@@ -2146,6 +2350,31 @@ impl<'a> WorldEditor<'a> {
             return;
         }
 
+        // A Create track cell claims its corridor the moment it is written: the
+        // cell itself, the levels above it and the cells beside it. Every pass
+        // that runs later - ground, caves, ore, decoration - must keep those
+        // cells clear, or the train drives inside a hill. NOTE: `Block::name()`
+        // is the bare name without namespace ("track", not "create:track"), so
+        // the test has to go through `namespace()`.
+        if block_with_props.block.namespace() == "create" {
+            self.create_rails.note_corridor((x, absolute_y, z));
+        }
+
+        // A Create rail corridor stays clear. The generator, the decorator and the
+        // tunnel carver all run AFTER the rails were written, so any block they
+        // put into a corridor is a wall the train drives inside, or vegetation
+        // it drives through. Only Create track itself and AIR (the corridor
+        // pass) may take such a cell; a corridor-diggable block is no exception
+        // - the generator never gets to write it in the first place, so no
+        // later pass can grow terrain back over the rails.
+        if block_with_props.block.namespace() != "create"
+            && block_with_props.block != AIR
+            && self.create_corridor_occupied(x, absolute_y, z)
+        {
+            self.create_rails
+                .note_guard_outcome((x, absolute_y, z), block_with_props.block.name());
+            return;
+        }
         // None/None is the dominant pattern; skip the redundant get_block() read.
         if override_whitelist.is_none() && override_blacklist.is_none() {
             self.world
@@ -2305,7 +2534,10 @@ impl<'a> WorldEditor<'a> {
     /// position (i.e. the in-memory overlay still holds AIR).
     ///
     /// This is faster than `set_block_absolute` with `None` whitelists/blacklists
-    /// because it avoids the double HashMap traversal.
+    /// because it avoids the double HashMap traversal. The Create rail corridor
+    /// check still has to run here - this is the fast path the ground generator
+    /// uses, and a topsoil block placed into a corridor is a wall the train
+    /// drives inside.
     #[inline]
     pub fn set_block_if_absent_absolute(
         &mut self,
@@ -2317,6 +2549,18 @@ impl<'a> WorldEditor<'a> {
         if !self.xzbbox.contains(&XZPoint::new(x, z)) || self.is_region_flushed(x, z) {
             return false;
         }
+        // Same corridor rule as the whitelisted path: nothing but Create track
+        // and AIR enters a declared corridor, so the generator's topsoil can
+        // never pave one shut.
+        if block != AIR
+            && block.namespace() != "create"
+            && self.create_corridor_occupied(x, absolute_y, z)
+        {
+            self.create_rails
+                .note_guard_outcome((x, absolute_y, z), block.name());
+            return false;
+        }
+
         self.world.set_block_if_absent(x, absolute_y, z, block)
     }
 
@@ -2352,6 +2596,30 @@ impl<'a> WorldEditor<'a> {
         if self.is_region_flushed(x, z) {
             return;
         }
+        // A column fill is the one bulk writer that can pave a corridor shut
+        // while bypassing the per-block guard (measured on osm-rail38: one
+        // dirt cell inside a claimed corridor). Split the range around cells
+        // a declared corridor owns - exempt cells (a mast foundation, a floor
+        // the corridor pass put back) stay fillable, everything else keeps
+        // its fill. Non-rail worlds never pay the per-cell check.
+        if self.create_rails.corridor_any() && block != AIR && block.namespace() != "create" {
+            let mut run: Option<i32> = None;
+            for y in y_min..=(y_max + 1) {
+                let blocked = y <= y_max && self.create_rails.corridor_contains((x, y, z));
+                match (run, blocked) {
+                    (Some(s), true) => {
+                        self.world.fill_column(x, z, s, y - 1, block, skip_existing);
+                        run = None;
+                    }
+                    (None, false) => run = Some(y),
+                    _ => {}
+                }
+            }
+            if let Some(s) = run {
+                self.world.fill_column(x, z, s, y_max, block, skip_existing);
+            }
+            return;
+        }
         self.world
             .fill_column(x, z, y_min, y_max, block, skip_existing);
     }
@@ -2363,9 +2631,30 @@ impl<'a> WorldEditor<'a> {
         z: i32,
         y_min: i32,
         y_max: i32,
-        block_at: impl FnMut(i32) -> Block,
+        mut block_at: impl FnMut(i32) -> Block,
     ) {
         if !self.xzbbox.contains(&XZPoint::new(x, z)) || self.is_region_flushed(x, z) {
+            return;
+        }
+        // Same corridor rule as fill_column_absolute. The strata closure is
+        // never evaluated for a skipped cell; runs stay ascending, so its
+        // absolute-y-driven walker resumes exactly where it left off.
+        if self.create_rails.corridor_any() {
+            let mut run: Option<i32> = None;
+            for y in y_min..=(y_max + 1) {
+                let blocked = y <= y_max && self.create_rails.corridor_contains((x, y, z));
+                match (run, blocked) {
+                    (Some(s), true) => {
+                        self.world.fill_column_with(x, z, s, y - 1, &mut block_at);
+                        run = None;
+                    }
+                    (None, false) => run = Some(y),
+                    _ => {}
+                }
+            }
+            if let Some(s) = run {
+                self.world.fill_column_with(x, z, s, y_max, &mut block_at);
+            }
             return;
         }
         self.world.fill_column_with(x, z, y_min, y_max, block_at);
@@ -2462,7 +2751,48 @@ impl<'a> WorldEditor<'a> {
             }
         }
 
+        self.write_create_rail_sidecars();
+
         Ok(())
+    }
+
+    /// Write the Create rail sidecars next to the world: `track_ways.json` (the
+    /// cells every OSM railway way was meant to cover, one row per way, ways
+    /// never merged) and `track_rejections.json` (connections the pre-write
+    /// validator refused, with coordinates and reason). `tools/check_curves_be.py`
+    /// reads both, so a gap in the network gets explained instead of guessed at.
+    fn write_create_rail_sidecars(&mut self) {
+        let report = &self.create_rails;
+        let parts: Vec<(String, String)> = vec![
+            ("track_ways.json".to_string(), report.sidecar_ways()),
+            (
+                "track_rejections.json".to_string(),
+                report.sidecar_rejections(),
+            ),
+            (
+                "track_corridors.json".to_string(),
+                report.sidecar_corridors(),
+            ),
+        ];
+        for (name, body) in &parts {
+            if body.is_empty() {
+                continue;
+            }
+            let path = self.world_dir.join(name);
+            match File::create(&path) {
+                Ok(mut file) => match write!(&mut file, "{}", body) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        let msg = ["Could not write ".to_string(), name.to_string()].concat();
+                        println!("{}", msg)
+                    }
+                },
+                Err(_) => {
+                    let msg = ["Could not write ".to_string(), name.to_string()].concat();
+                    println!("{}", msg)
+                }
+            }
+        }
     }
 
     /// Seal the voxy LOD database. A failure here costs the user nothing but
@@ -2865,6 +3195,151 @@ impl Drop for FlushWorker {
     }
 }
 
+/// Centre of the exit face of a `create:track` anchor block: the block origin
+/// is its min corner, `+0.5` applies to X/Z only (Y stays at the block floor
+/// because Create's curve tangents are horizontal), and half an axis step more
+/// lands on the face the curve leaves through (NOTES.md §5, verified on all
+/// eight curve ends of the reference world `track-stage2`).
+pub fn curve_start(anchor: &(i32, i32, i32), axis: &(f64, f64, f64)) -> (f64, f64, f64) {
+    (
+        anchor.0 as f64 + 0.5 + 0.5 * axis.0,
+        anchor.1 as f64 + 0.5 * axis.1,
+        anchor.2 as f64 + 0.5 + 0.5 * axis.2,
+    )
+}
+
+/// Cells the `create:fake_track` chain of one Create curve passes through, in
+/// travel order; the anchors' own cells may be included and are skipped by the
+/// caller.
+///
+/// The chain follows the cubic Bezier between the two exit-face centres whose
+/// control points sit `h` along each tangent, walked in unit arc-length steps;
+/// a step becomes the cell below/right/near on X/Z and the one above on Y
+/// (`floor`, `ceil`, `floor`), which is how the hand-built curves of the
+/// reference world `track-stage2` come out: its fitted handle range is
+/// [3.25, 3.5] for a quarter turn of radius 8 and [3.5, 4.0] for a 1-in-5
+/// slope, so `h = max(3.5, 7/16 * largest span)` reproduces both and grows the
+/// smoothing with the curve size for arbitrary radius and steepness.
+pub fn create_curve_cells(
+    start_a: (f64, f64, f64),
+    start_b: (f64, f64, f64),
+    axes_a: &(f64, f64, f64),
+    axes_b: &(f64, f64, f64),
+) -> Vec<(i32, i32, i32)> {
+    let delta = (
+        (start_b.0 - start_a.0).abs(),
+        (start_b.1 - start_a.1).abs(),
+        (start_b.2 - start_a.2).abs(),
+    );
+    let span = delta.0.max(delta.1).max(delta.2);
+    let h = (0.4375 * span).max(3.5);
+
+    let ctrl_a = (
+        start_a.0 + h * axes_a.0,
+        start_a.1 + h * axes_a.1,
+        start_a.2 + h * axes_a.2,
+    );
+    let ctrl_b = (
+        start_b.0 + h * axes_b.0,
+        start_b.1 + h * axes_b.1,
+        start_b.2 + h * axes_b.2,
+    );
+
+    let point = |t: f64| -> (f64, f64, f64) {
+        let u = 1.0 - t;
+        let w = |a: f64, b: f64, c: f64, d: f64| -> f64 {
+            u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+        };
+        (
+            w(start_a.0, ctrl_a.0, ctrl_b.0, start_b.0),
+            w(start_a.1, ctrl_a.1, ctrl_b.1, start_b.1),
+            w(start_a.2, ctrl_a.2, ctrl_b.2, start_b.2),
+        )
+    };
+
+    let samples = 4000usize;
+    let mut cells: Vec<(i32, i32, i32)> = vec![];
+    let mut previous;
+    let mut travelled = 0.0;
+    let mut next_step = 1.0;
+    let mut before = point(0.0);
+    let first_cell = (
+        before.0.floor() as i32,
+        (before.1 - 1e-9).ceil() as i32,
+        before.2.floor() as i32,
+    );
+    previous = Some(first_cell);
+    cells.push(first_cell);
+
+    for i in 1..=samples {
+        let t = i as f64 / samples as f64;
+        let here = point(t);
+        travelled += ((here.0 - before.0) * (here.0 - before.0)
+            + (here.1 - before.1) * (here.1 - before.1)
+            + (here.2 - before.2) * (here.2 - before.2))
+            .sqrt();
+        before = here;
+
+        if travelled < next_step {
+            continue;
+        }
+        next_step += 1.0;
+
+        let cell = (
+            here.0.floor() as i32,
+            (here.1 - 1e-9).ceil() as i32,
+            here.2.floor() as i32,
+        );
+        if match previous {
+            Some(p) => p == cell,
+            None => false,
+        } {
+            continue;
+        }
+        previous = Some(cell);
+        cells.push(cell);
+    }
+
+    cells
+}
+
+/// The `create:fake_track` cells to emit for one curve: the walked chain without
+/// the anchors' own cells, plus the cell directly in front of each anchor exit
+/// face. The voxel rule (`floor`, `ceil`, `floor`) is not symmetric, so walking
+/// a curve from the opposite end can miss that neighbour cell (e.g. a 1-in-5
+/// slope run along `-Z` misses the block right after the lower anchor), which
+/// would leave a physical gap in the track.
+pub fn create_curve_emission(
+    start_a: (f64, f64, f64),
+    start_b: (f64, f64, f64),
+    a: (i32, i32, i32),
+    b: (i32, i32, i32),
+    axes_a: (f64, f64, f64),
+    axes_b: (f64, f64, f64),
+) -> Vec<(i32, i32, i32)> {
+    let mut out: Vec<(i32, i32, i32)> = vec![];
+    for cell in create_curve_cells(start_a, start_b, &axes_a, &axes_b) {
+        if cell == a || cell == b {
+            continue;
+        }
+        let last = out.len();
+        if last == 0 || out[last - 1] != cell {
+            out.push(cell);
+        }
+    }
+    for (anchor, axes) in [(&a, &axes_a), (&b, &axes_b)] {
+        let cell = (
+            anchor.0 + axes.0.round() as i32,
+            anchor.1 + axes.1.round() as i32,
+            anchor.2 + axes.2.round() as i32,
+        );
+        if cell != a && cell != b && !out.contains(&cell) {
+            out.push(cell);
+        }
+    }
+    out
+}
+
 #[allow(dead_code)]
 fn single_item(id: &str, slot: i8, count: i8) -> HashMap<String, Value> {
     let mut item = HashMap::new();
@@ -3126,6 +3601,76 @@ mod eviction_guard_tests {
         ] {
             assert!(is_passable_cover(cover), "{cover}");
         }
+    }
+
+    #[test]
+    fn create_curve_cells_match_the_reference_world() {
+        // Quarter turn of radius 8 from the reference save `track-stage2`.
+        let turn = create_curve_cells(
+            curve_start(&(56, -61, 24), &(-1.0, 0.0, 0.0)),
+            curve_start(&(48, -61, 32), &(0.0, 0.0, -1.0)),
+            &(-1.0, 0.0, 0.0),
+            &(0.0, 0.0, -1.0),
+        );
+        let turn_expected = [
+            (56, -61, 24),
+            (55, -61, 24),
+            (54, -61, 24),
+            (53, -61, 25),
+            (52, -61, 25),
+            (51, -61, 26),
+            (50, -61, 27),
+            (49, -61, 28),
+            (49, -61, 29),
+            (48, -61, 30),
+            (48, -61, 31),
+        ];
+        assert_eq!(turn, turn_expected.to_vec());
+
+        // 1-in-5 slope from the same save: the height change is not linear.
+        let slope = create_curve_cells(
+            curve_start(&(96, -61, 50), &(0.0, 0.0, 1.0)),
+            curve_start(&(96, -60, 55), &(0.0, 0.0, -1.0)),
+            &(0.0, 0.0, 1.0),
+            &(0.0, 0.0, -1.0),
+        );
+        assert_eq!(
+            slope,
+            [(96, -61, 51), (96, -60, 52), (96, -60, 53), (96, -60, 54)].to_vec(),
+        );
+    }
+
+    #[test]
+    fn create_curve_emission_covers_the_anchor_exit_face_on_reversed_curves() {
+        // Same 1-in-5 slope walked the other way (lower anchor at the higher
+        // coordinate, tangents flipped): the raw chain misses the cell in front
+        // of the lower anchor, which would leave a hole in the track.
+        let fwd = create_curve_emission(
+            curve_start(&(96, -61, 50), &(0.0, 0.0, 1.0)),
+            curve_start(&(96, -60, 55), &(0.0, 0.0, -1.0)),
+            (96, -61, 50),
+            (96, -60, 55),
+            (0.0, 0.0, 1.0),
+            (0.0, 0.0, -1.0),
+        );
+        let rev = create_curve_emission(
+            curve_start(&(60, -61, 92), &(0.0, 0.0, -1.0)),
+            curve_start(&(60, -60, 87), &(0.0, 0.0, 1.0)),
+            (60, -61, 92),
+            (60, -60, 87),
+            (0.0, 0.0, -1.0),
+            (0.0, 0.0, 1.0),
+        );
+        // mirrored geometry of the same slope must give the mirrored cell set
+        let want_fwd = [(96, -61, 51), (96, -60, 52), (96, -60, 53), (96, -60, 54)];
+        let want_rev = [(60, -61, 91), (60, -60, 90), (60, -60, 89), (60, -60, 88)];
+        let sorted = |cells: Vec<(i32, i32, i32)>| {
+            let mut s = cells.clone();
+            s.sort();
+            s
+        };
+        assert_eq!(sorted(fwd), sorted(want_fwd.to_vec()));
+        assert_eq!(sorted(rev), sorted(want_rev.to_vec()));
     }
 
     #[test]
